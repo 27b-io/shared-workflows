@@ -75,6 +75,8 @@ jobs:
           MCPEOF
 
       - uses: anthropics/claude-code-action@3428ca8991d4611b464661a70b0725ae459c894d
+        env:
+          ANTHROPIC_BASE_URL: http://anthropic-lb.arc-runners.svc.cluster.local:8082
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           show_full_output: true
