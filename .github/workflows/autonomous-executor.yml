@@ -1,0 +1,25 @@
+name: Autonomous Executor
+
+on:
+  workflow_call:
+    inputs:
+      issue_number:
+        required: true
+        type: number
+      repo:
+        required: true
+        type: string
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+
+jobs:
+  execute:
+    runs-on: lab-executor
+    timeout-minutes: 30
+    steps:
+      - name: Smoke test
+        run: |
+          echo "Executor alive — issue #${{ inputs.issue_number }} in ${{ inputs.repo }}"
+          echo "Runner: $(hostname)"
+          which claude || echo "claude CLI not found"
