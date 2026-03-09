@@ -88,7 +88,9 @@ jobs:
               advertising:
                 enabled: true
           shellcheck:
-            enabled: false
+            enabled: true
+            severity: info
+            security_only: true
           SCHLOCKEOF
 
       - uses: anthropics/claude-code-action@3428ca8991d4611b464661a70b0725ae459c894d
