@@ -49,12 +49,12 @@ jobs:
           gh issue comment ${{ inputs.issue_number }} \
             --body "Autonomous executor started. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
-      - name: Generate MCP config
+      - name: Generate MCP and schlock config
         env:
           MCP_MEMORY_URL: ${{ secrets.MCP_MEMORY_URL || 'http://mcp-memory.mcp.svc.cluster.local:8001/mcp' }}
           CONTEXT7_API_KEY: ${{ secrets.CONTEXT7_API_KEY }}
         run: |
-          mkdir -p .claude
+          mkdir -p .claude/hooks
           cat > .claude/mcp.json <<MCPEOF
           {
             "mcpServers": {
@@ -73,12 +73,33 @@ jobs:
             }
           }
           MCPEOF
+          cat > .claude/hooks/schlock-config.yaml <<'SCHLOCKEOF'
+          risk_tolerance:
+            preset: permissive
+            levels:
+              SAFE: allow
+              LOW: allow
+              MEDIUM: allow
+              HIGH: allow
+              BLOCKED: deny
+          commit_filter:
+            enabled: true
+            rules:
+              advertising:
+                enabled: true
+          shellcheck:
+            enabled: false
+          SCHLOCKEOF
 
       - uses: anthropics/claude-code-action@3428ca8991d4611b464661a70b0725ae459c894d
         env:
           ANTHROPIC_BASE_URL: http://anthropic-lb.arc-runners.svc.cluster.local:8082
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          bot_name: "27Bslash6"
+          bot_id: "2221076"
+          plugin_marketplaces: "https://github.com/27Bslash6/schlock.git"
+          plugins: "schlock@27b"
           prompt: |
             You are implementing GitHub issue #${{ inputs.issue_number }}
             for the ${{ inputs.repo }} project.
@@ -110,20 +131,13 @@ jobs:
               MCP is read-only for pattern lookup. Log your work as an issue comment.
             - Do NOT modify files outside the scope of this issue.
             - Follow existing code patterns and conventions.
+            - Do NOT include any "Generated with" attribution, watermarks, or
+              advertising in commits, PR descriptions, or comments.
           settings: |
             {
               "permissions": {
                 "allow": ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "LSP"],
                 "deny": ["WebFetch", "WebSearch", "Agent", "NotebookEdit"]
-              },
-              "hooks": {
-                "PreToolUse": [{
-                  "matcher": "Bash",
-                  "hooks": [{
-                    "type": "command",
-                    "command": "schlock validate"
-                  }]
-                }]
               }
             }
 
