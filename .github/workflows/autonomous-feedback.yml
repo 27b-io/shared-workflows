@@ -1,0 +1,301 @@
+name: Autonomous Feedback
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        required: true
+        type: string
+      repo:
+        required: true
+        type: string
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+      ANTHROPIC_LB_URL:
+        required: false
+      MCP_MEMORY_URL:
+        required: false
+      CONTEXT7_API_KEY:
+        required: false
+
+jobs:
+  respond:
+    runs-on: lab-executor
+    timeout-minutes: 20
+    concurrency:
+      group: feedback-${{ inputs.repo }}-${{ inputs.pr_number }}
+      cancel-in-progress: true
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - name: Check PR labels (gate)
+        id: gate
+        env:
+          GH_REPO: 27b-io/${{ inputs.repo }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          LABELS=$(gh pr view ${{ inputs.pr_number }} --json labels --jq '[.labels[].name]')
+
+          # Must have autonomous label
+          if ! echo "$LABELS" | jq -e 'index("autonomous")' > /dev/null 2>&1; then
+            echo "::notice::PR does not have 'autonomous' label — skipping"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Must NOT have needs-human
+          if echo "$LABELS" | jq -e 'index("needs-human")' > /dev/null 2>&1; then
+            echo "::notice::PR has 'needs-human' label — circuit breaker active"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Must NOT have feedback-round-3 (circuit breaker threshold)
+          if echo "$LABELS" | jq -e 'index("feedback-round-3")' > /dev/null 2>&1; then
+            echo "::notice::PR at feedback-round-3 — circuit breaker, adding needs-human"
+            gh pr edit ${{ inputs.pr_number }} --add-label "needs-human"
+            gh pr comment ${{ inputs.pr_number }} \
+              --body "🛑 Circuit breaker: 3 feedback rounds exhausted. Labelling \`needs-human\` for manual intervention. [Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Determine current round
+          CURRENT_ROUND=0
+          for i in 2 1 0; do
+            if echo "$LABELS" | jq -e "index(\"feedback-round-${i}\")" > /dev/null 2>&1; then
+              CURRENT_ROUND=$i
+              break
+            fi
+          done
+          NEXT_ROUND=$((CURRENT_ROUND + 1))
+
+          echo "current_round=${CURRENT_ROUND}" >> "$GITHUB_OUTPUT"
+          echo "next_round=${NEXT_ROUND}" >> "$GITHUB_OUTPUT"
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Budget gate
+        if: steps.gate.outputs.proceed == 'true'
+        id: budget
+        env:
+          ANTHROPIC_LB_URL: ${{ secrets.ANTHROPIC_LB_URL }}
+          GH_REPO: 27b-io/${{ inputs.repo }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ANTHROPIC_LB_URL:-}" ]; then
+            echo "::notice::No ANTHROPIC_LB_URL — skipping budget check"
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          STATS=$(curl -sf --max-time 10 "${ANTHROPIC_LB_URL}/_stats" 2>/dev/null) || {
+            echo "::warning::/_stats unreachable — proceeding (fail open for feedback)"
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          HEADROOM=$(echo "$STATS" | jq -r '
+            [.accounts[] |
+              (.limits.requests_remaining // 0) / ((.limits.requests_limit // 1) | if . == 0 then 1 else . end)
+            ] | add / length * 100 // 0
+          ')
+
+          if (( $(echo "$HEADROOM < 5" | bc -l) )); then
+            echo "::warning::Budget headroom ${HEADROOM}% — queuing feedback"
+            gh pr edit ${{ inputs.pr_number }} --add-label "feedback-queued"
+            gh pr comment ${{ inputs.pr_number }} \
+              --body "⏸️ Feedback queued — budget headroom at ${HEADROOM}%. Will retry when budget allows."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            # Remove feedback-queued if present (budget recovered)
+            gh pr edit ${{ inputs.pr_number }} --remove-label "feedback-queued" 2>/dev/null || true
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repo
+        if: steps.gate.outputs.proceed == 'true' && steps.budget.outputs.proceed == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          repository: 27b-io/${{ inputs.repo }}
+          ref: ${{ inputs.pr_number }}
+          fetch-depth: 0
+
+      - name: Checkout PR branch
+        if: steps.gate.outputs.proceed == 'true' && steps.budget.outputs.proceed == 'true'
+        env:
+          GH_REPO: 27b-io/${{ inputs.repo }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BRANCH=$(gh pr view ${{ inputs.pr_number }} --json headRefName --jq '.headRefName')
+          git checkout "$BRANCH"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble context
+        if: steps.gate.outputs.proceed == 'true' && steps.budget.outputs.proceed == 'true'
+        id: context
+        env:
+          GH_REPO: 27b-io/${{ inputs.repo }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Get the linked issue number from PR body
+          ISSUE_NUM=$(gh pr view ${{ inputs.pr_number }} --json body --jq '.body' | \
+            grep -oP 'Closes #\K\d+' | head -1 || echo "")
+
+          if [ -n "$ISSUE_NUM" ]; then
+            gh issue view "$ISSUE_NUM" --json body --jq '.body' > /tmp/issue-body.txt
+            echo "issue_number=${ISSUE_NUM}" >> "$GITHUB_OUTPUT"
+          else
+            echo "No linked issue found" > /tmp/issue-body.txt
+            echo "issue_number=" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Get the full review thread
+          gh pr view ${{ inputs.pr_number }} --json reviews --jq '
+            .reviews[] | "[\(.author.login)] (\(.state)):\n\(.body)\n---"
+          ' > /tmp/review-thread.txt 2>/dev/null || echo "No reviews" > /tmp/review-thread.txt
+
+          # Get review comments (inline)
+          gh api "repos/27b-io/${{ inputs.repo }}/pulls/${{ inputs.pr_number }}/comments" \
+            --jq '.[] | "[\(.user.login)] on \(.path):\(.line // .original_line):\n\(.body)\n---"' \
+            > /tmp/review-comments.txt 2>/dev/null || echo "No inline comments" > /tmp/review-comments.txt
+
+          # Get the PR diff
+          gh pr diff ${{ inputs.pr_number }} > /tmp/pr-diff.txt 2>/dev/null || echo "No diff" > /tmp/pr-diff.txt
+
+          # Truncate diff to 30k chars to stay within context
+          head -c 30000 /tmp/pr-diff.txt > /tmp/pr-diff-truncated.txt
+
+      - name: Generate MCP and schlock config
+        if: steps.gate.outputs.proceed == 'true' && steps.budget.outputs.proceed == 'true'
+        env:
+          MCP_MEMORY_URL: ${{ secrets.MCP_MEMORY_URL || 'http://mcp-memory.mcp.svc.cluster.local:8001/mcp' }}
+          CONTEXT7_API_KEY: ${{ secrets.CONTEXT7_API_KEY }}
+        run: |
+          mkdir -p .claude/hooks
+          cat > .claude/mcp.json <<MCPEOF
+          {
+            "mcpServers": {
+              "memory": {
+                "type": "http",
+                "url": "${MCP_MEMORY_URL}"
+              },
+              "context7": {
+                "type": "stdio",
+                "command": "npx",
+                "args": ["-y", "@upstash/context7-mcp@2.1.3"],
+                "env": {
+                  "CONTEXT7_API_KEY": "${CONTEXT7_API_KEY}"
+                }
+              }
+            }
+          }
+          MCPEOF
+          cat > .claude/hooks/schlock-config.yaml <<'SCHLOCKEOF'
+          risk_tolerance:
+            preset: permissive
+            levels:
+              SAFE: allow
+              LOW: allow
+              MEDIUM: allow
+              HIGH: allow
+              BLOCKED: deny
+          commit_filter:
+            enabled: true
+            rules:
+              advertising:
+                enabled: true
+          shellcheck:
+            enabled: true
+            severity: info
+            security_only: true
+          SCHLOCKEOF
+
+      - name: Address feedback
+        if: steps.gate.outputs.proceed == 'true' && steps.budget.outputs.proceed == 'true'
+        uses: anthropics/claude-code-action@3428ca8991d4611b464661a70b0725ae459c894d
+        env:
+          ANTHROPIC_BASE_URL: http://anthropic-lb.arc-runners.svc.cluster.local:8082
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          bot_name: "27Bslash6"
+          bot_id: "2221076"
+          plugin_marketplaces: "https://github.com/27Bslash6/schlock.git"
+          plugins: "schlock@27b"
+          prompt: |
+            You are addressing review feedback on PR #${{ inputs.pr_number }}
+            for the ${{ inputs.repo }} project. This is feedback round ${{ steps.gate.outputs.next_round }}.
+
+            ## Original Issue
+            The original issue specification is in /tmp/issue-body.txt. Read it for context.
+
+            ## Review Feedback
+            Review thread is in /tmp/review-thread.txt.
+            Inline review comments are in /tmp/review-comments.txt.
+            Current PR diff is in /tmp/pr-diff-truncated.txt.
+
+            Read ALL of these files first.
+
+            ## Instructions
+            1. Read the review feedback carefully
+            2. Read the project's CLAUDE.md and any steering docs
+            3. Address ONLY the specific issues raised in the reviews
+            4. Do NOT expand scope beyond what reviewers requested
+            5. Do NOT touch files that are not already part of this PR's diff,
+               unless a reviewer explicitly requests changes to a specific file
+            6. Run the full test suite and fix any failures your changes introduce
+            7. Commit with message: fix(#${{ steps.context.outputs.issue_number }}): address review round ${{ steps.gate.outputs.next_round }}
+            8. Push your changes (the workflow handles force-push)
+            9. Post a comment on PR #${{ inputs.pr_number }} summarising what you changed
+               and which review comments you addressed
+
+            ## Restrictions
+            - Do NOT write to MCP memory. MCP is read-only for pattern lookup.
+            - Address the feedback. Do not argue with reviewers.
+            - Do NOT include any "Generated with" attribution or watermarks.
+            - Scope lock: only files in the existing diff unless reviewer says otherwise.
+          settings: |
+            {
+              "permissions": {
+                "allow": ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "LSP"],
+                "deny": ["WebFetch", "WebSearch", "Agent", "NotebookEdit"]
+              }
+            }
+
+      - name: Bump feedback round label
+        if: steps.gate.outputs.proceed == 'true' && steps.budget.outputs.proceed == 'true'
+        env:
+          GH_REPO: 27b-io/${{ inputs.repo }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          CURRENT=${{ steps.gate.outputs.current_round }}
+          NEXT=${{ steps.gate.outputs.next_round }}
+
+          # Remove current round label, add next
+          gh pr edit ${{ inputs.pr_number }} \
+            --remove-label "feedback-round-${CURRENT}" \
+            --add-label "feedback-round-${NEXT}" 2>/dev/null || \
+          gh pr edit ${{ inputs.pr_number }} \
+            --add-label "feedback-round-${NEXT}"
+
+          echo "Bumped feedback round: ${CURRENT} → ${NEXT}"
+
+      - name: Handle failure
+        if: failure() && steps.gate.outputs.proceed == 'true'
+        env:
+          GH_REPO: 27b-io/${{ inputs.repo }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment ${{ inputs.pr_number }} \
+            --body "⚠️ Feedback round ${{ steps.gate.outputs.next_round }} failed. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

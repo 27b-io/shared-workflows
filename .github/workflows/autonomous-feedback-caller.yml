@@ -1,0 +1,22 @@
+# Thin caller for autonomous feedback (same-repo)
+name: Autonomous Feedback Caller
+on:
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  respond:
+    uses: ./.github/workflows/autonomous-feedback.yml
+    with:
+      pr_number: ${{ github.event.pull_request.number }}
+      repo: shared-workflows
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
