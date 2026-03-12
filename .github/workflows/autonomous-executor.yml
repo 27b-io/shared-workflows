@@ -12,6 +12,8 @@ on:
     secrets:
       ANTHROPIC_API_KEY:
         required: true
+      STEV3_BOT_PEM:
+        required: true
       MCP_MEMORY_URL:
         required: false
       CONTEXT7_API_KEY:
@@ -48,6 +50,41 @@ jobs:
         run: |
           gh issue comment ${{ inputs.issue_number }} \
             --body "Autonomous executor started. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Generate stev3-bot token
+        id: stev3-token
+        env:
+          STEV3_BOT_PEM: ${{ secrets.STEV3_BOT_PEM }}
+        run: |
+          set -euo pipefail
+          CLIENT_ID="Iv23lieFLYEGsNrjeOYu"
+          INSTALL_ID="114974235"
+
+          PEM_FILE=$(mktemp)
+          echo "$STEV3_BOT_PEM" > "$PEM_FILE"
+          trap "rm -f $PEM_FILE" EXIT
+
+          NOW=$(date +%s)
+          IAT=$((NOW - 60))
+          EXP=$((NOW + 600))
+
+          HEADER=$(printf '{"alg":"RS256","typ":"JWT"}' | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+          PAYLOAD=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$IAT" "$EXP" "$CLIENT_ID" | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+          SIGNATURE=$(printf '%s.%s' "$HEADER" "$PAYLOAD" | openssl dgst -sha256 -sign "$PEM_FILE" 2>/dev/null | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+          JWT="${HEADER}.${PAYLOAD}.${SIGNATURE}"
+
+          TOKEN=$(curl -s -X POST \
+            -H "Authorization: Bearer $JWT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/app/installations/${INSTALL_ID}/access_tokens" | jq -r '.token')
+
+          if [ "$TOKEN" = "null" ] || [ -z "$TOKEN" ]; then
+            echo "ERROR: Failed to generate stev3-bot token" >&2
+            exit 1
+          fi
+
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
 
       - name: Generate MCP and schlock config
         env:
@@ -96,10 +133,12 @@ jobs:
       - uses: anthropics/claude-code-action@3428ca8991d4611b464661a70b0725ae459c894d
         env:
           ANTHROPIC_BASE_URL: http://anthropic-lb.arc-runners.svc.cluster.local:8082
+          GH_TOKEN: ${{ steps.stev3-token.outputs.token }}
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          bot_name: "27Bslash6"
-          bot_id: "2221076"
+          github_token: ${{ steps.stev3-token.outputs.token }}
+          bot_name: "stev3-bot[bot]"
+          bot_id: "266581962"
           plugin_marketplaces: "https://github.com/27Bslash6/schlock.git"
           plugins: "schlock@27b"
           prompt: |
@@ -144,7 +183,8 @@ jobs:
                - test_name: what it covers
 
             10. Comment on issue #${{ inputs.issue_number }} with a structured
-                work log: files changed, approach taken, tests added, decisions made
+                work log: files changed, approach taken, tests added, decisions made.
+                ALSO post the same work log as a comment on the PR you opened.
 
             ## Restrictions
             - Do NOT write to MCP memory (store_memory, relation, supersede).
