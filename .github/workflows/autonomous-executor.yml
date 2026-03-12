@@ -62,7 +62,7 @@ jobs:
 
           PEM_FILE=$(mktemp)
           echo "$STEV3_BOT_PEM" > "$PEM_FILE"
-          trap "rm -f $PEM_FILE" EXIT
+          trap 'rm -f "$PEM_FILE"' EXIT
 
           NOW=$(date +%s)
           IAT=$((NOW - 60))
@@ -73,13 +73,23 @@ jobs:
           SIGNATURE=$(printf '%s.%s' "$HEADER" "$PAYLOAD" | openssl dgst -sha256 -sign "$PEM_FILE" 2>/dev/null | openssl base64 -A | tr '+/' '-_' | tr -d '=')
           JWT="${HEADER}.${PAYLOAD}.${SIGNATURE}"
 
-          TOKEN=$(curl -s -X POST \
+          HTTP_CODE=$(mktemp)
+          RESPONSE=$(curl -s -w '%{http_code}' -o /dev/stdout \
+            -X POST \
             -H "Authorization: Bearer $JWT" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/app/installations/${INSTALL_ID}/access_tokens" | jq -r '.token')
+            "https://api.github.com/app/installations/${INSTALL_ID}/access_tokens" \
+            2>/dev/null) || true
+          STATUS="${RESPONSE: -3}"
+          BODY="${RESPONSE:0:${#RESPONSE}-3}"
 
-          if [ "$TOKEN" = "null" ] || [ -z "$TOKEN" ]; then
-            echo "ERROR: Failed to generate stev3-bot token" >&2
+          TOKEN=$(echo "$BODY" | jq -r '.token // empty')
+          API_MSG=$(echo "$BODY" | jq -r '.message // empty')
+
+          if [ -z "$TOKEN" ]; then
+            echo "ERROR: Failed to generate stev3-bot token (HTTP $STATUS)" >&2
+            [ -n "$API_MSG" ] && echo "API message: $API_MSG" >&2
+            echo "Response: $BODY" >&2
             exit 1
           fi
 
