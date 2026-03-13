@@ -243,6 +243,23 @@ jobs:
 
           echo "Labelled PR #${PR_NUM}: autonomous, feedback-round-0${PRIORITY:+, $PRIORITY}"
 
+      - name: Trigger CodeRabbit review
+        if: success()
+        env:
+          GH_REPO: 27b-io/${{ inputs.repo }}
+          GH_TOKEN: ${{ steps.stev3-token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          PR_NUM=$(gh pr list --json number,body --jq '
+            [.[] | select(.body | test("Closes #${{ inputs.issue_number }}"))] | first | .number
+          ' 2>/dev/null || echo "")
+
+          if [ -n "$PR_NUM" ]; then
+            gh pr comment "$PR_NUM" --body "@coderabbitai review"
+            echo "Triggered CodeRabbit review on PR #${PR_NUM}"
+          fi
+
       - name: Handle failure
         if: failure()
         env:
