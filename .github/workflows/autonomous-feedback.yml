@@ -12,6 +12,8 @@ on:
     secrets:
       ANTHROPIC_API_KEY:
         required: true
+      STEV3_BOT_PEM:
+        required: true
       ANTHROPIC_LB_URL:
         required: false
       MCP_MEMORY_URL:
@@ -176,6 +178,52 @@ jobs:
           # Truncate diff to 30k chars to stay within context
           head -c 30000 /tmp/pr-diff.txt > /tmp/pr-diff-truncated.txt
 
+      - name: Generate stev3-bot token
+        if: steps.gate.outputs.proceed == 'true' && steps.budget.outputs.proceed == 'true'
+        id: stev3-token
+        env:
+          STEV3_BOT_PEM: ${{ secrets.STEV3_BOT_PEM }}
+        run: |
+          set -euo pipefail
+          CLIENT_ID="Iv23lieFLYEGsNrjeOYu"
+          INSTALL_ID="114974235"
+
+          PEM_FILE=$(mktemp)
+          echo "$STEV3_BOT_PEM" > "$PEM_FILE"
+          trap 'rm -f "$PEM_FILE"' EXIT
+
+          NOW=$(date +%s)
+          IAT=$((NOW - 60))
+          EXP=$((NOW + 600))
+
+          HEADER=$(printf '{"alg":"RS256","typ":"JWT"}' | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+          PAYLOAD=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$IAT" "$EXP" "$CLIENT_ID" | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+          SIGNATURE=$(printf '%s.%s' "$HEADER" "$PAYLOAD" | openssl dgst -sha256 -sign "$PEM_FILE" 2>/dev/null | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+          JWT="${HEADER}.${PAYLOAD}.${SIGNATURE}"
+
+          HTTP_CODE=$(mktemp)
+          RESPONSE=$(curl -s -w '%{http_code}' -o /dev/stdout \
+            -X POST \
+            -H "Authorization: Bearer $JWT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/app/installations/${INSTALL_ID}/access_tokens" \
+            2>/dev/null) || true
+          STATUS="${RESPONSE: -3}"
+          BODY="${RESPONSE:0:${#RESPONSE}-3}"
+
+          TOKEN=$(echo "$BODY" | jq -r '.token // empty')
+          API_MSG=$(echo "$BODY" | jq -r '.message // empty')
+
+          if [ -z "$TOKEN" ]; then
+            echo "ERROR: Failed to generate stev3-bot token (HTTP $STATUS)" >&2
+            [ -n "$API_MSG" ] && echo "API message: $API_MSG" >&2
+            echo "Response: $BODY" >&2
+            exit 1
+          fi
+
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
       - name: Generate MCP and schlock config
         if: steps.gate.outputs.proceed == 'true' && steps.budget.outputs.proceed == 'true'
         env:
@@ -226,10 +274,12 @@ jobs:
         uses: anthropics/claude-code-action@3428ca8991d4611b464661a70b0725ae459c894d
         env:
           ANTHROPIC_BASE_URL: http://anthropic-lb.arc-runners.svc.cluster.local:8082
+          GH_TOKEN: ${{ steps.stev3-token.outputs.token }}
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          bot_name: "27Bslash6"
-          bot_id: "2221076"
+          github_token: ${{ steps.stev3-token.outputs.token }}
+          bot_name: "stev3-bot[bot]"
+          bot_id: "266581962"
           plugin_marketplaces: "https://github.com/27Bslash6/schlock.git"
           plugins: "schlock@27b"
           prompt: |
