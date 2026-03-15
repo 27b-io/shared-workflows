@@ -127,7 +127,6 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           repository: 27b-io/${{ inputs.repo }}
-          ref: ${{ inputs.pr_number }}
           fetch-depth: 0
 
       - name: Checkout PR branch
@@ -138,6 +137,7 @@ jobs:
         run: |
           set -euo pipefail
           BRANCH=$(gh pr view ${{ inputs.pr_number }} --json headRefName --jq '.headRefName')
+          git fetch origin "$BRANCH"
           git checkout "$BRANCH"
           echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
 
